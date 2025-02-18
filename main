@@ -1,0 +1,742 @@
+import ctypes
+from ctypes import wintypes
+from pycaw.pycaw import AudioUtilities
+import tkinter as tk
+from tkinter import ttk
+import ttkbootstrap as tb
+from ttkbootstrap.constants import PRIMARY, SUCCESS, WARNING, DARK, INFO
+import keyboard
+import threading
+import pystray
+from pystray import MenuItem as item
+from PIL import Image, ImageTk
+import os
+import sys
+import winreg
+import json
+import time
+
+# ----------------------- VARIABLES GLOBALES -----------------------
+last_next_song_time = 0
+last_prev_song_time = 0
+active_process = None
+
+# Lista de controles dinámicos de procesos
+process_controls = []
+
+# Variables para la interfaz y configuración
+status_label = None
+pause_key = None  # Inicializada en None
+# "light" o "dark" para indicar el tema (light usa "flatly" y dark usa "darkly")
+current_theme = "light"
+toggle_theme_button = None
+
+# Otras opciones
+start_with_windows = False
+minimize_on_close = False
+
+# Teclas por defecto
+user_volume_up_vk = 0xAF  # VK_VOLUME_UP
+user_volume_down_vk = 0xAE  # VK_VOLUME_DOWN
+user_next_song_key = None
+user_prev_song_key = None
+
+# Bandera para el script
+script_active = False
+hook_thread_started = False
+
+# Variable global para el tray icon
+tray_icon = None
+
+# ----------------------- RUTAS DE RECURSOS -----------------------
+def resource_path(relative_path):
+    """Devuelve la ruta absoluta para archivos de recursos."""
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# ----------------------- CONFIGURACIÓN DE RUTAS -----------------------
+if getattr(sys, 'frozen', False):
+    CONFIG_FILE = os.path.join(os.path.dirname(sys.executable), "config.json")
+else:
+    CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+# ----------------------- CONSTANTES Y ESTRUCTURAS WIN32 -----------------------
+WH_KEYBOARD_LL = 13
+WM_KEYDOWN = 0x0100
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+
+class KBDLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
+if sys.maxsize > 2**32:
+    LP_TYPE = ctypes.c_longlong
+else:
+    LP_TYPE = ctypes.c_long
+
+user32.CallNextHookEx.restype = ctypes.c_long
+user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, LP_TYPE]
+
+LowLevelKeyboardProc = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+# ----------------------- FUNCIONES DE UTILIDAD -----------------------
+def vk_to_key_name(vk):
+    """Devuelve un nombre de tecla comprensible a partir de un vkCode."""
+    if vk == user_volume_up_vk:
+        return "Volumen Arriba"
+    elif vk == user_volume_down_vk:
+        return "Volumen Abajo"
+    else:
+        scan_code = user32.MapVirtualKeyW(vk, 0)
+        buffer = ctypes.create_unicode_buffer(64)
+        lParam_val = scan_code << 16
+        user32.GetKeyNameTextW(lParam_val, buffer, 64)
+        return buffer.value
+
+def create_icon_image():
+    """Crea la imagen del ícono de la bandeja del sistema."""
+    return Image.open(resource_path("slack_icon.png")).convert("RGBA")
+
+# ----------------------- FUNCIONES PARA MEDIA -----------------------
+def next_song():
+    global last_next_song_time
+    if not script_active:
+        return
+    now = time.time()
+    if now - last_next_song_time < 0.3:
+        return
+    last_next_song_time = now
+    user32.keybd_event(VK_MEDIA_NEXT_TRACK, 0, 0, 0)
+    time.sleep(0.05)
+    user32.keybd_event(VK_MEDIA_NEXT_TRACK, 0, 2, 0)
+    print("Siguiente canción.")
+
+def prev_song():
+    global last_prev_song_time
+    if not script_active:
+        return
+    now = time.time()
+    if now - last_prev_song_time < 0.3:
+        return
+    last_prev_song_time = now
+    user32.keybd_event(VK_MEDIA_PREV_TRACK, 0, 0, 0)
+    time.sleep(0.05)
+    user32.keybd_event(VK_MEDIA_PREV_TRACK, 0, 2, 0)
+    print("Canción anterior.")
+
+# ----------------------- CONFIGURAR TECLAS (MULTITHREAD) -----------------------
+def set_next_song_key():
+    status_label.config(text="Presiona la tecla para pasar a la siguiente canción...", bootstyle=PRIMARY)
+    next_song_button.config(text="Esperando tecla...", bootstyle=DARK)
+    def worker():
+        while True:
+            key_event = keyboard.read_event(suppress=True)
+            if key_event.event_type == 'down':
+                break
+        def update_ui():
+            global user_next_song_key
+            user_next_song_key = key_event.name
+            next_song_button.config(text=f"Siguiente Canción: {user_next_song_key}")
+            status_label.config(text=f"Tecla para siguiente canción configurada: {user_next_song_key}", bootstyle=SUCCESS)
+            keyboard.add_hotkey(user_next_song_key, next_song)
+        root.after(0, update_ui)
+    threading.Thread(target=worker, daemon=True).start()
+
+def set_prev_song_key():
+    status_label.config(text="Presiona la tecla para pasar a la canción anterior...", bootstyle=PRIMARY)
+    prev_song_button.config(text="Esperando tecla...", bootstyle=DARK)
+    def worker():
+        while True:
+            key_event = keyboard.read_event(suppress=True)
+            if key_event.event_type == 'down':
+                break
+        def update_ui():
+            global user_prev_song_key
+            user_prev_song_key = key_event.name
+            prev_song_button.config(text=f"Anterior Canción: {user_prev_song_key}")
+            status_label.config(text=f"Tecla para canción anterior configurada: {user_prev_song_key}", bootstyle=SUCCESS)
+            keyboard.add_hotkey(user_prev_song_key, prev_song)
+        root.after(0, update_ui)
+    threading.Thread(target=worker, daemon=True).start()
+
+def set_volume_up_key():
+    status_label.config(text="Presiona la tecla para subir el volumen...", bootstyle=PRIMARY)
+    volume_up_button.config(text="Esperando tecla...", bootstyle=DARK)
+    def worker():
+        while True:
+            key_event = keyboard.read_event(suppress=True)
+            if key_event.event_type == 'down':
+                break
+        def update_ui():
+            global user_volume_up_vk
+            if key_event.name.lower() in ["volume up", "vol up"]:
+                user_volume_up_vk = 0xAF
+                new_text = "Subir Volumen: Volume Up"
+            else:
+                scan_code = key_event.scan_code
+                user_volume_up_vk = user32.MapVirtualKeyW(scan_code, 1)
+                new_text = f"Subir Volumen: {key_event.name}"
+            volume_up_button.config(text=new_text)
+            status_label.config(text=f"Tecla para subir volumen configurada: {key_event.name}", bootstyle=SUCCESS)
+        root.after(0, update_ui)
+    threading.Thread(target=worker, daemon=True).start()
+
+def set_volume_down_key():
+    status_label.config(text="Presiona la tecla para bajar el volumen...", bootstyle=PRIMARY)
+    volume_down_button.config(text="Esperando tecla...", bootstyle=DARK)
+    def worker():
+        while True:
+            key_event = keyboard.read_event(suppress=True)
+            if key_event.event_type == 'down':
+                break
+        def update_ui():
+            global user_volume_down_vk
+            if key_event.name.lower() in ["volume down", "vol down"]:
+                user_volume_down_vk = 0xAE
+                new_text = "Bajar Volumen: Volume Down"
+            else:
+                scan_code = key_event.scan_code
+                user_volume_down_vk = user32.MapVirtualKeyW(scan_code, 1)
+                new_text = f"Bajar Volumen: {key_event.name}"
+            volume_down_button.config(text=new_text)
+            status_label.config(text=f"Tecla para bajar volumen configurada: {key_event.name}", bootstyle=SUCCESS)
+        root.after(0, update_ui)
+    threading.Thread(target=worker, daemon=True).start()
+
+def set_pause_key():
+    status_label.config(text="Presiona la tecla para activar/desactivar el control de volumen...", bootstyle=PRIMARY)
+    pause_button.config(text="Esperando tecla...", bootstyle=DARK)
+    def worker():
+        while True:
+            key_event = keyboard.read_event(suppress=True)
+            if key_event.event_type == 'down':
+                break
+        def update_ui():
+            global pause_key
+            pause_key = key_event.name
+            keyboard.add_hotkey(pause_key, toggle_script)
+            pause_button.config(text=f"Toggle: {pause_key}", bootstyle=DARK)
+            status_label.config(text=f"Tecla de toggle configurada: {pause_key}", bootstyle=SUCCESS)
+        root.after(0, update_ui)
+    threading.Thread(target=worker, daemon=True).start()
+
+def set_activate_key(idx):
+    status_label.config(text=f"Pulsa una tecla para activar el proceso #{idx+1}...", bootstyle=PRIMARY)
+    process_controls[idx]["activate_button"].config(text="Esperando tecla...", bootstyle=DARK)
+    def worker():
+        while True:
+            key_event = keyboard.read_event(suppress=True)
+            if key_event.event_type == 'down':
+                break
+        def update_ui():
+            key_pressed = key_event.name
+            process_controls[idx]["activate_key"] = key_pressed
+            process_controls[idx]["activate_button"].config(text=f"Tecla: {key_pressed}", bootstyle=DARK)
+            keyboard.add_hotkey(key_pressed, lambda: activate_script(process_controls[idx]["selected_process"]))
+            status_label.config(text=f"Tecla vinculada para proceso #{idx+1}: {key_pressed}", bootstyle=SUCCESS)
+        root.after(0, update_ui)
+    threading.Thread(target=worker, daemon=True).start()
+
+# ----------------------- FUNCIONES PRINCIPALES -----------------------
+def get_audio_processes():
+    """Devuelve la lista de nombres de procesos de audio activos."""
+    sessions = AudioUtilities.GetAllSessions()
+    return sorted(set(session.Process.name() for session in sessions if session.Process))
+
+def get_process_session(process_name):
+    """Devuelve la sesión de audio correspondiente a un proceso, o None si no existe."""
+    sessions = AudioUtilities.GetAllSessions()
+    for session in sessions:
+        if session.Process and session.Process.name().lower() == process_name.lower():
+            return session
+    return None
+
+def adjust_process_volume(process_name, increase=True):
+    """Ajusta el volumen del proceso especificado."""
+    sessions = AudioUtilities.GetAllSessions()
+    target_sessions = [s for s in sessions if s.Process and s.Process.name().lower() == process_name.lower()]
+    if not target_sessions:
+        print(f"{process_name} no está en ejecución.")
+        return
+    for session in target_sessions:
+        volume = session.SimpleAudioVolume
+        current_volume = volume.GetMasterVolume()
+        step = 0.01 if current_volume < 0.2 else (0.05 if current_volume < 0.5 else 0.1)
+        new_volume = max(0.0, min(1.0, current_volume + (step if increase else -step)))
+        volume.SetMasterVolume(new_volume, None)
+        print(f"Volumen de {process_name} ajustado a: {new_volume * 100:.0f}%")
+
+def block_volume_keys(nCode, wParam, lParam):
+    """Hook para bloquear/redirigir las teclas de volumen al proceso activo."""
+    global active_process
+    if nCode >= 0 and script_active and active_process:
+        key_info = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+        vk_code = key_info.vkCode
+        if vk_code in {user_volume_up_vk, user_volume_down_vk}:
+            if wParam == WM_KEYDOWN:
+                adjust_process_volume(active_process, increase=(vk_code == user_volume_up_vk))
+            return 1
+    return user32.CallNextHookEx(None, nCode, wParam, LP_TYPE(lParam))
+
+def start_keyboard_hook():
+    """Inicia el hook de teclado en un hilo separado."""
+    def hook_proc(nCode, wParam, lParam):
+        return block_volume_keys(nCode, wParam, lParam)
+    keyboard_proc = LowLevelKeyboardProc(hook_proc)
+    hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, keyboard_proc, None, 0)
+    try:
+        msg = wintypes.MSG()
+        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        user32.UnhookWindowsHookEx(hook)
+
+# ----------------------- CONTROLES DE PROCESOS DINÁMICOS -----------------------
+def add_process_control():
+    """Agrega una nueva fila de control de proceso al frame y a la lista global."""
+    idx = len(process_controls)
+    row_frame = tb.Frame(process_frame)
+    row_frame.pack(pady=2, fill='x')
+    
+    combobox = ttk.Combobox(row_frame, values=get_audio_processes(), width=30)
+    combobox.pack(side='left', padx=5)
+    combobox.bind("<<ComboboxSelected>>", lambda event, i=idx: on_process_select(event, i))
+    
+    activate_btn = tb.Button(
+        row_frame,
+        text="Vincular Tecla",
+        bootstyle=DARK,
+        command=lambda i=idx: set_activate_key(i),
+        takefocus=False
+    )
+    activate_btn.pack(side='left', padx=5)
+    
+    process_controls.append({
+        "frame": row_frame,
+        "combobox": combobox,
+        "activate_button": activate_btn,
+        "selected_process": None,
+        "activate_key": None
+    })
+    if status_label is not None:
+        status_label.config(text=f"Proceso {idx+1} agregado.", bootstyle=SUCCESS)
+
+def remove_process_control():
+    """Elimina la última entrada de procesos (si existe)."""
+    if process_controls:
+        entry = process_controls.pop()
+        entry["frame"].destroy()
+        if status_label is not None:
+            status_label.config(text="Último proceso eliminado.", bootstyle=WARNING)
+    else:
+        if status_label is not None:
+            status_label.config(text="No hay procesos para eliminar.", bootstyle=WARNING)
+
+def on_process_select(event, idx):
+    """Asigna el proceso seleccionado en el combobox al dict global."""
+    process_controls[idx]["selected_process"] = process_controls[idx]["combobox"].get()
+
+def update_process_feedback():
+    """Muestra el volumen actual de cada proceso en el Text."""
+    feedback_text.delete("1.0", tk.END)
+    for entry in process_controls:
+        proc = entry.get("selected_process")
+        if proc:
+            session = get_process_session(proc)
+            if session:
+                vol = session.SimpleAudioVolume.GetMasterVolume()
+                feedback_text.insert(tk.END, f"{proc}: {vol * 100:.0f}%\n")
+    root.after(1000, update_process_feedback)
+
+def refresh_audio_processes():
+    """Refresca la lista de procesos de audio cada cierto tiempo."""
+    new_values = sorted(set(get_audio_processes()))
+    for entry in process_controls:
+        current = entry["combobox"].get()
+        entry["combobox"]['values'] = new_values
+        if current not in new_values:
+            entry["combobox"].set("")
+    root.after(3000, refresh_audio_processes)
+
+# ----------------------- GUARDAR/CARGAR CONFIGURACIÓN -----------------------
+def save_config():
+    """Guarda la configuración en config.json, incluyendo el tema."""
+    config = {
+        "process_controls": [
+            {"selected_process": entry["selected_process"], "activate_key": entry["activate_key"]}
+            for entry in process_controls
+        ],
+        "pause_key": pause_key,
+        "start_with_windows": start_with_windows,
+        "minimize_on_close": minimize_on_close,
+        "user_volume_up_vk": user_volume_up_vk,
+        "user_volume_down_vk": user_volume_down_vk,
+        "user_next_song_key": user_next_song_key,
+        "user_prev_song_key": user_prev_song_key,
+        "theme": current_theme
+    }
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f)
+        status_label.config(text="Configuración guardada.", bootstyle=SUCCESS)
+    except Exception as e:
+        status_label.config(text=f"Error al guardar configuración: {e}", bootstyle=WARNING)
+
+def load_config():
+    """Carga la configuración desde config.json y la aplica a la interfaz."""
+    global pause_key, start_with_windows, minimize_on_close, user_volume_up_vk, user_volume_down_vk
+    global user_next_song_key, user_prev_song_key, current_theme
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+            proc_conf = config.get("process_controls", [])
+            
+            # Limpiamos controles existentes
+            for entry in process_controls:
+                entry["frame"].destroy()
+            process_controls.clear()
+            
+            # Cargamos controles
+            for conf in proc_conf:
+                add_process_control()
+                idx = len(process_controls) - 1
+                selected_process_value = conf.get("selected_process", "")
+                if not isinstance(selected_process_value, str):
+                    if isinstance(selected_process_value, list) and selected_process_value:
+                        selected_process_value = selected_process_value[0]
+                    else:
+                        selected_process_value = str(selected_process_value)
+                process_controls[idx]["combobox"].set(selected_process_value)
+                process_controls[idx]["selected_process"] = selected_process_value
+
+                key = conf.get("activate_key")
+                if key:
+                    process_controls[idx]["activate_key"] = key
+                    process_controls[idx]["activate_button"].config(text=f"Tecla: {key}")
+                    keyboard.add_hotkey(key, lambda proc=selected_process_value: activate_script(proc))
+
+            pause_key = config.get("pause_key", None)
+            if pause_key:
+                pause_button.config(text=f"Toggle: {pause_key}")
+                keyboard.add_hotkey(pause_key, toggle_script)
+
+            start_with_windows = config.get("start_with_windows", False)
+            minimize_on_close = config.get("minimize_on_close", False)
+            user_volume_up_vk = config.get("user_volume_up_vk", 0xAF)
+            user_volume_down_vk = config.get("user_volume_down_vk", 0xAE)
+
+            user_next_song_key = config.get("user_next_song_key")
+            if user_next_song_key:
+                next_song_button.config(text=f"Siguiente Canción: {user_next_song_key}")
+                keyboard.add_hotkey(user_next_song_key, next_song)
+
+            user_prev_song_key = config.get("user_prev_song_key")
+            if user_prev_song_key:
+                prev_song_button.config(text=f"Anterior Canción: {user_prev_song_key}")
+                keyboard.add_hotkey(user_prev_song_key, prev_song)
+
+            # Cargar el tema
+            theme_conf = config.get("theme", "light")
+            if theme_conf == "dark":
+                root.style.theme_use("darkly")
+                current_theme = "dark"
+                toggle_theme_button.config(image=root.sun_icon)
+            else:
+                root.style.theme_use("flatly")
+                current_theme = "light"
+                toggle_theme_button.config(image=root.moon_icon)
+
+            startup_button.config(text=f"Iniciar con Windows: {'Activado' if start_with_windows else 'Desactivado'}")
+            minimize_button.config(text=f"Minimizar al cerrar: {'Activado' if minimize_on_close else 'Desactivado'}")
+            volume_up_button.config(text=f"Subir Volumen: {vk_to_key_name(user_volume_up_vk)}")
+            volume_down_button.config(text=f"Bajar Volumen: {vk_to_key_name(user_volume_down_vk)}")
+
+            status_label.config(text="Configuración cargada.", bootstyle=SUCCESS)
+        except Exception as e:
+            status_label.config(text=f"Error al cargar configuración: {e}", bootstyle=WARNING)
+
+# ----------------------- CONTROL DE VOLUMEN POR PROCESO -----------------------
+def activate_script(process_name):
+    """Activa el control de volumen para el proceso especificado."""
+    global script_active, hook_thread_started, active_process
+    if not script_active:
+        status_label.config(text="El control está desactivado. Activa el toggle para usar esta función.", bootstyle=WARNING)
+        return
+    if not process_name:
+        status_label.config(text="Selecciona un proceso antes de activar.", bootstyle=WARNING)
+        return
+    active_process = process_name
+    if not hook_thread_started:
+        threading.Thread(target=start_keyboard_hook, daemon=True).start()
+        hook_thread_started = True
+    status_label.config(text=f"Estado: Activado para {active_process}", bootstyle=SUCCESS)
+
+def toggle_script():
+    """Activa/Desactiva el script de control de volumen."""
+    global script_active, hook_thread_started, active_process
+    if script_active:
+        script_active = False
+        status_label.config(text="Estado: Desactivado", bootstyle=WARNING)
+    else:
+        if not hook_thread_started:
+            any_proc = None
+            for entry in process_controls:
+                if entry.get("selected_process"):
+                    any_proc = entry["selected_process"]
+                    break
+            if not any_proc:
+                status_label.config(text="Selecciona al menos un proceso antes de activar.", bootstyle=WARNING)
+                return
+            active_process = any_proc
+            threading.Thread(target=start_keyboard_hook, daemon=True).start()
+            hook_thread_started = True
+        script_active = True
+        for entry in process_controls:
+            if entry.get("selected_process"):
+                active_process = entry["selected_process"]
+                break
+        status_label.config(text=f"Estado: Activado para {active_process}", bootstyle=SUCCESS)
+
+# ----------------------- ICONO DE BANDEJA DEL SISTEMA -----------------------
+def create_tray_icon():
+    """Crea el ícono de la bandeja en un hilo separado."""
+    global tray_icon
+    def on_quit(icon, item):
+        icon.stop()
+        root.destroy()
+    def on_tray_menu(icon, item):
+        root.deiconify()
+    def tray_setup(icon):
+        icon.visible = True
+    def update_tray_icon():
+        while True:
+            tray_icon.icon = create_icon_image()
+            time.sleep(1)
+    icon_image = create_icon_image()
+    tray_icon = pystray.Icon("Volumen", icon_image, menu=pystray.Menu(
+        item("Abrir aplicación", on_tray_menu, default=True),
+        item("Salir", on_quit)
+    ))
+    threading.Thread(target=update_tray_icon, daemon=True).start()
+    tray_icon.run(setup=tray_setup)
+
+# ----------------------- INICIO CON WINDOWS -----------------------
+def add_to_startup():
+    path = sys.argv[0]
+    reg_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    reg_value = "SoundMixer"
+    try:
+        reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_WRITE)
+        winreg.SetValueEx(reg, reg_value, 0, winreg.REG_SZ, path)
+        winreg.CloseKey(reg)
+        print("Aplicación configurada para iniciar con Windows.")
+    except Exception as e:
+        print(f"Error al agregar a inicio: {e}")
+
+def remove_from_startup():
+    reg_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+    reg_value = "SoundMixer"
+    try:
+        reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_key, 0, winreg.KEY_WRITE)
+        winreg.DeleteValue(reg, reg_value)
+        winreg.CloseKey(reg)
+        print("Aplicación eliminada del inicio de Windows.")
+    except Exception as e:
+        print(f"Error al eliminar de inicio: {e}")
+
+def minimize_on_close_toggle():
+    global minimize_on_close
+    minimize_on_close = not minimize_on_close
+    minimize_button.config(text=f"Minimizar al cerrar: {'Activado' if minimize_on_close else 'Desactivado'}", bootstyle=DARK)
+
+def start_with_windows_toggle():
+    global start_with_windows
+    start_with_windows = not start_with_windows
+    if start_with_windows:
+        add_to_startup()
+    else:
+        remove_from_startup()
+    startup_button.config(text=f"Iniciar con Windows: {'Activado' if start_with_windows else 'Desactivado'}", bootstyle=DARK)
+
+def on_close():
+    """Cierra la ventana o la minimiza según la configuración. Detiene el tray icon para un cierre definitivo."""
+    global tray_icon
+    if minimize_on_close:
+        root.withdraw()
+    else:
+        if tray_icon is not None:
+            tray_icon.stop()
+        root.destroy()
+
+# ----------------------- ESTILO TRANSPARENTE PARA EL BOTÓN DE TEMA -----------------------
+def update_transparent_style():
+    """Ajusta el estilo 'Transparent.Toolbutton' para que el botón parezca sin fondo."""
+    bg_color = root.style.lookup(".", "background", default="#000000")
+    root.style.configure(
+        "Transparent.Toolbutton",
+        background=bg_color,
+        bordercolor=bg_color,
+        relief="flat",
+        borderwidth=0,
+        focusthickness=0,
+        highlightthickness=0
+    )
+    # Evitamos que el botón se vea resaltado al tener foco
+    root.style.map(
+        "Transparent.Toolbutton",
+        background=[
+            ("active", bg_color),
+            ("pressed", bg_color),
+            ("focus", bg_color)
+        ],
+        relief=[
+            ("active", "flat"),
+            ("pressed", "flat"),
+            ("focus", "flat")
+        ],
+        highlightcolor=[
+            ("focus", bg_color)
+        ],
+        bordercolor=[
+            ("focus", bg_color)
+        ],
+    )
+
+# ----------------------- CAMBIO DE TEMA -----------------------
+def toggle_theme():
+    global current_theme, root, toggle_theme_button
+    if current_theme == "light":
+        root.style.theme_use("darkly")
+        current_theme = "dark"
+        toggle_theme_button.config(image=root.sun_icon)
+    else:
+        root.style.theme_use("flatly")
+        current_theme = "light"
+        toggle_theme_button.config(image=root.moon_icon)
+    update_transparent_style()
+
+# ----------------------- INTERFAZ GRÁFICA -----------------------
+def main():
+    global root, process_frame, pause_button, minimize_button, startup_button
+    global volume_up_button, volume_down_button, next_song_button, prev_song_button
+    global status_label, feedback_text, toggle_theme_button
+
+    root = tb.Window(themename="flatly")
+    root.title("Echoz")
+    root.geometry("600x800")
+
+    # Establece el icono de la ventana usando un .ico
+    try:
+        root.iconbitmap(resource_path("slack_icon.ico"))
+    except Exception as e:
+        print(f"No se pudo cargar el icono .ico: {e}")
+
+    # Quitar contorno en los TButton
+    root.style.configure("TButton", focusthickness=0, highlightthickness=0)
+    update_transparent_style()
+
+    # Encabezado
+    header_frame = tb.Frame(root)
+    header_frame.pack(pady=10)
+    title_label = tb.Label(header_frame, text="Echoz", font=("Helvetica", 28, "bold"), bootstyle=INFO)
+    title_label.pack(side='left', padx=(0,10))
+    version_label = tb.Label(header_frame, text="V1", font=("Helvetica", 10), bootstyle=INFO)
+    version_label.pack(side='left')
+    
+    # Controles de procesos
+    process_frame = tb.Frame(root)
+    process_frame.pack(pady=10)
+    
+    control_buttons_frame = tb.Frame(root)
+    control_buttons_frame.pack(pady=5)
+    add_btn = tb.Button(control_buttons_frame, text="Añadir Proceso", bootstyle=INFO, command=add_process_control, takefocus=False)
+    add_btn.pack(side='left', padx=5)
+    remove_btn = tb.Button(control_buttons_frame, text="Eliminar Último Proceso", bootstyle=WARNING, command=remove_process_control, takefocus=False)
+    remove_btn.pack(side='left', padx=5)
+    add_process_control()
+    
+    refresh_proc_btn = tb.Button(root, text="🔄 Actualizar procesos", bootstyle=INFO, command=refresh_audio_processes, takefocus=False)
+    refresh_proc_btn.pack(pady=5)
+    
+    # Opciones generales
+    frame_config = tb.Frame(root)
+    frame_config.pack(pady=10)
+    pause_button = tb.Button(frame_config, text="Establecer tecla de toggle", bootstyle=DARK, command=set_pause_key, takefocus=False)
+    pause_button.grid(row=0, column=0, padx=5, pady=5)
+    minimize_button = tb.Button(frame_config, text="Minimizar al cerrar: Desactivado", bootstyle=DARK, command=minimize_on_close_toggle, takefocus=False)
+    minimize_button.grid(row=0, column=1, padx=5, pady=5)
+    startup_button = tb.Button(frame_config, text="Iniciar con Windows: Desactivado", bootstyle=DARK, command=start_with_windows_toggle, takefocus=False)
+    startup_button.grid(row=0, column=2, padx=5, pady=5)
+    save_button = tb.Button(frame_config, text="Guardar Configuración", bootstyle=DARK, command=save_config, takefocus=False)
+    save_button.grid(row=1, column=0, columnspan=3, padx=5, pady=5)
+    
+    # Teclas de volumen y control de canciones
+    frame_volume = tb.Frame(root)
+    frame_volume.pack(pady=10)
+    volume_up_button = tb.Button(frame_volume, text=f"Subir Volumen: {vk_to_key_name(user_volume_up_vk)}", bootstyle=DARK, command=set_volume_up_key, takefocus=False)
+    volume_up_button.grid(row=0, column=0, padx=5, pady=5)
+    volume_down_button = tb.Button(frame_volume, text=f"Bajar Volumen: {vk_to_key_name(user_volume_down_vk)}", bootstyle=DARK, command=set_volume_down_key, takefocus=False)
+    volume_down_button.grid(row=0, column=1, padx=5, pady=5)
+    prev_song_button = tb.Button(frame_volume, text="Anterior Canción: Sin Configurar", bootstyle=DARK, command=set_prev_song_key, takefocus=False)
+    prev_song_button.grid(row=1, column=0, padx=5, pady=5)
+    next_song_button = tb.Button(frame_volume, text="Siguiente Canción: Sin Configurar", bootstyle=DARK, command=set_next_song_key, takefocus=False)
+    next_song_button.grid(row=1, column=1, padx=5, pady=5)
+    
+    status_label = tb.Label(root, text="Selecciona un proceso para empezar.", bootstyle=PRIMARY)
+    status_label.pack(pady=10)
+
+    feedback_text = tk.Text(root, width=60, height=10, bd=0, highlightthickness=0, relief="flat",
+                             borderwidth=0, insertborderwidth=0, highlightcolor=root.cget("background"),
+                             highlightbackground=root.cget("background"), bg=root.cget("background"))
+    feedback_text.pack(pady=10)
+    
+    globals()['status_label'] = status_label
+    globals()['feedback_text'] = feedback_text
+
+    # Botón para cambiar el tema (iconos sol y luna)
+    moon_img = Image.open(resource_path("moon.png")).convert("RGBA").resize((20, 20), Image.LANCZOS)
+    moon_icon = ImageTk.PhotoImage(moon_img)
+    sun_img = Image.open(resource_path("sun.png")).convert("RGBA").resize((20, 20), Image.LANCZOS)
+    sun_icon = ImageTk.PhotoImage(sun_img)
+    root.sun_icon = sun_icon
+    root.moon_icon = moon_icon
+
+    toggle_theme_button = tb.Button(
+        root,
+        image=moon_icon,
+        command=toggle_theme,
+        style="Transparent.Toolbutton",
+        takefocus=False
+    )
+    toggle_theme_button.place(relx=0.98, rely=0.02, anchor='ne')
+    # Forzamos que, si recibe foco, se reasigna al root
+    toggle_theme_button.bind("<FocusIn>", lambda event: root.focus_set())
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    refresh_audio_processes()
+    update_process_feedback()
+    load_config()
+    
+    # Crea el ícono de bandeja en un hilo aparte
+    tray_thread = threading.Thread(target=create_tray_icon, daemon=True)
+    tray_thread.start()
+    
+    root.mainloop()
+
+if __name__ == '__main__':
+    main()
